@@ -62,8 +62,25 @@ def attention_scores_kernel(
     # Step 3: Compute dot-product scores and scale
     # Step 4: Store scores
 
-    # YOUR CODE HERE
-    pass
+    #Define blocks
+    offs_d = tl.arange(0, BLOCK_D)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    #Locate: block position(By thread in gird id) + in the block offset(By block shape you difined)
+    q_ptr = q_ptr + pid_bh * stride_q0 + pid_q * stride_q1 + offs_d * stride_q2
+    q = tl.load(q_ptr, mask=offs_d < head_dim, other=0.0)
+
+    k_ptr = k_ptr + pid_bh * stride_k0 + offs_k[:, None]*stride_k1 + offs_d[None, :]*stride_k2
+    k = tl.load(k_ptr, mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim), other=0.0)
+
+    #Compute scores, use tl.sum and inner product instead of tl.dot, 
+    #Because tl.dot will use Tensor Cores which enquire specific size of matrix to perform high speed computations.
+    scores = tl.sum(k*q[None, :], axis=1) * scale
+    s_ptr = scores_ptr + pid_bh * stride_s0 + pid_q * stride_s1 + offs_k * stride_s2
+
+    tl.store(s_ptr, scores, mask=offs_k < seq_k)
+
+
 
 
 @triton.jit
@@ -82,9 +99,19 @@ def softmax_inplace_kernel(scores_ptr, stride_s, seq_k, BLOCK_SIZE: tl.constexpr
     # Step 2: Subtract max for stability
     # Step 3: Compute exp and normalize
     # Step 4: Store back
+    offs_k = tl.arange(0, BLOCK_SIZE)
+    mask = offs_k < seq_k
 
-    # YOUR CODE HERE
-    pass
+    # There should be a stride of offs_k, but since we're doing softmax on the last dimension, we can assum offs_k is contiguous.
+    s_str = scores_ptr + row * stride_s + offs_k
+    s = tl.load(s_str, mask=mask, other=-1e9)
+
+    s_max = tl.max(s, axis=0)
+    s = tl.exp(s - s_max)
+    s_sum = tl.sum(s, axis=0)
+    s = s / s_sum
+    
+    tl.store(s_str, s, mask=mask)
 
 
 @triton.jit
@@ -121,10 +148,19 @@ def attention_output_kernel(
     # Step 2: Load all values for this batch_head
     # Step 3: Compute weighted sum
     # Step 4: Store output
+    offs_d = tl.arange(0, BLOCK_D)
+    offs_k = tl.arange(0, BLOCK_K)
 
-    # YOUR CODE HERE
-    pass
+    a_ptr = attn_ptr + pid_bh * stride_w0 + pid_q * stride_w1 + offs_k * stride_w2
+    attn = tl.load(a_ptr, mask=offs_k < seq_k, other=0.0)
 
+    v_ptr = v_ptr + pid_bh * stride_v0 + offs_k[:, None] * stride_v1 + stride_v2 * offs_d[None, :]
+    v = tl.load(v_ptr, mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim), other=0.0)
+
+    output = tl.sum(attn[:, None] * v, axis=0)
+
+    o_ptr = output_ptr + pid_bh * stride_o0 + pid_q * stride_o1 + offs_d * stride_o2
+    tl.store(o_ptr, output, mask=offs_d < head_dim)
 
 @triton.jit
 def causal_mask_kernel(
