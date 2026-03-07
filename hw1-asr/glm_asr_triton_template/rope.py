@@ -60,6 +60,39 @@ def compute_freqs_kernel(
     # Step 5: Store concatenated cos/sin
 
     # YOUR CODE HERE
+    offs = tl.arange(0, BLOCK)
+
+    #offs_inverse_freq = pid * BLOCK + tl.arange(0, BLOCK)
+    mask_inverse_freq = offs < half_dim
+    #由于BLOCK 必须是 2 的幂且 >= half_dim，triton.next_power_of_2 自动向上取整：block = triton.next_power_of_2(half_dim)
+    #这里的BLOCK切分可能会越界，要做mask
+
+    pos = tl.load(positions_ptr + pid * stride_pos)#取出来应该值是一个常量 这里mask没有用，因为pid不会超过位置数量
+    #pos用pid取。 pid是一个常量，取出来就是一个标量值
+    inverse_freq = tl.load(inv_freq_ptr + offs * stride_inv, mask=mask_inverse_freq, other=0.0)#这里mask很重要！！！
+    #这里inverse_freq用offs取，arange会生成“数组”，这里取出来就是长度为half_dim的矢量
+
+    theta = pos * inverse_freq# 这个计算包含类型提升，结果为长度为half_dim的矢量
+
+    sin = tl.sin(theta)
+    cos = tl.cos(theta)
+
+    # 存储cos，sin
+    # 本来是n/2长度，存储时concat一下，复制一份，变成n
+    # 存储时的位置：行号：pid     列号：offs
+    # 复制后存储需跳过的地址 half_dim列 也就是在计算sin1乘的时候加上half_dim
+
+    mask = (pid < seq_len) & (offs < half_dim) #行pid的判断是恒成立的，因为是常量
+
+    sin_ptrs_1 = sin_ptr + offs * stride_sin1 + pid * stride_sin0
+    tl.store(sin_ptrs_1, sin, mask=mask)#应该concat两个sin！！！
+    tl.store(sin_ptrs_1 + half_dim * stride_sin1, sin, mask=mask)
+
+    cos_ptrs_1 = cos_ptr + offs * stride_cos1 + pid * stride_cos0
+    tl.store(cos_ptrs_1, cos, mask=mask)#应该concat两个cos ！！！
+    tl.store(cos_ptrs_1 + half_dim * stride_cos1, cos, mask=mask)
+
+    
     pass
 
 

@@ -126,6 +126,26 @@ def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     # Step 3: Store output
 
     # YOUR CODE HERE
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
+    r = tl.load(x_ptr + offs, mask=mask, other=0.0)
+
+    #这里可以注意精度问题！！！！！！！！！！！！！！！！！！！！！！！
+    #这里有没有可以简化的方法！！！！！！！！！！！！！！！！！！！！！！
+    sqrt_pi = 0.7978845608028654  # sqrt(2/pi)
+    r_32 = r.to(tl.float32)
+
+    res = r_32 * r_32 * r_32 * 0.044715
+    res = res + r_32
+    res = res * sqrt_pi
+    res = libdevice.tanh(res) + 1
+    res = res * 0.5 * r_32
+
+    #y_16 = res.to(tl.float16)
+    #好像输入的时候就是32精度的？
+
+    tl.store(y_ptr + offs, res, mask=mask)
+
     pass
 
 
