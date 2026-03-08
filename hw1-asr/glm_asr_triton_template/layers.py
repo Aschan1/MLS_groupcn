@@ -133,21 +133,13 @@ def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
 def silu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     """
     SiLU/Swish: x * sigmoid(x)
-
-    *** TODO: Implement this kernel ***
     """
     pid = tl.program_id(0)
-
-    # ============================================================================
-    # TODO: Implement SiLU kernel
-    # ============================================================================
-    #
-    # Step 1: Load input tile
-    # Step 2: Compute sigmoid
-    # Step 3: Multiply and store
-
-    # YOUR CODE HERE
-    pass
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    y = x * tl.sigmoid(x)
+    tl.store(y_ptr + offs, y, mask=mask)
 
 
 @triton.jit
@@ -334,7 +326,7 @@ def embedding_kernel(
 def softmax_kernel(x_ptr, y_ptr, stride_x, stride_y, n_cols, BLOCK_SIZE: tl.constexpr):
     """
     Numerically stable softmax over last dimension.
-
+    
     *** TODO: Implement this kernel ***
     """
     row = tl.program_id(0)
@@ -348,8 +340,14 @@ def softmax_kernel(x_ptr, y_ptr, stride_x, stride_y, n_cols, BLOCK_SIZE: tl.cons
     # Step 3: Compute exp and normalize
     # Step 4: Store output
 
-    # YOUR CODE HERE
-    pass
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < n_cols
+    x = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=-float("inf"))
+    x = x - tl.max(x, axis=0)
+    exp_x = tl.exp(x)
+    denom = tl.sum(exp_x, axis=0)
+    y = exp_x / denom
+    tl.store(y_ptr + row * stride_y + cols, y, mask=mask)
 
 
 @triton.jit
