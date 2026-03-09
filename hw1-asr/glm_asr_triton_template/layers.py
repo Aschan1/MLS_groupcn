@@ -51,13 +51,6 @@ def rmsnorm_kernel(
     eps,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """
-    RMSNorm: x / RMS(x) * weight
-
-    *** TODO: Implement this kernel ***
-
-    Grid: (batch_size,)
-    """
     pid = tl.program_id(0)
     offs = tl.arange(0, BLOCK_SIZE)
     mask = offs < hidden_size
@@ -89,13 +82,6 @@ def layernorm_kernel(
     eps,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """
-    LayerNorm: (x - mean) / sqrt(var + eps) * weight + bias
-
-    *** TODO: Implement this kernel ***
-
-    Grid: (batch_size,)
-    """
     pid = tl.program_id(0)
 
     offs = tl.arange(0, BLOCK_SIZE)
@@ -171,14 +157,6 @@ def linear_kernel_tf32(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """
-    TF32-style matmul: output = A @ B.
-    A: (M, K), B: (K, N), C: (M, N)
-
-    *** TODO: Implement this kernel ***
-
-    Grid: (M // BLOCK_M, N // BLOCK_N)
-    """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
