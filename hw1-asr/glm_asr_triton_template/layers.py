@@ -51,25 +51,22 @@ def rmsnorm_kernel(
     eps,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """
-    RMSNorm: x / RMS(x) * weight
-
-    *** TODO: Implement this kernel ***
-
-    Grid: (batch_size,)
-    """
     pid = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < hidden_size
+    x_ptrs = x_ptr + pid * stride_x + offs
+    x = tl.load(x_ptrs, mask=mask, other=0.0)
+    w = tl.load(w_ptr + offs, mask=mask, other=0.0)
 
-    # ============================================================================
-    # TODO: Implement RMSNorm kernel
-    # ============================================================================
-    #
-    # Step 1: Load input row and weight
-    # Step 2: Compute variance = mean(x^2)
-    # Step 3: Normalize: x / sqrt(variance + eps)
-    # Step 4: Apply weight and store
-
-    # YOUR CODE HERE
+    x_sq = x * x
+    var = tl.sum(x_sq, axis=0) / hidden_size
+    
+    rsqrt = 1.0 / tl.sqrt(var + eps)
+    x_normed = x * rsqrt
+    
+    out = x_normed * w
+    y_ptrs = y_ptr + pid * stride_y + offs
+    tl.store(y_ptrs, out, mask=mask)
     pass
 
 
@@ -85,27 +82,27 @@ def layernorm_kernel(
     eps,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """
-    LayerNorm: (x - mean) / sqrt(var + eps) * weight + bias
-
-    *** TODO: Implement this kernel ***
-
-    Grid: (batch_size,)
-    """
     pid = tl.program_id(0)
 
-    # ============================================================================
-    # TODO: Implement LayerNorm kernel
-    # ============================================================================
-    #
-    # Step 1: Load input, weight, and bias
-    # Step 2: Compute mean
-    # Step 3: Center the data
-    # Step 4: Compute variance = mean((x - mean)^2)
-    # Step 5: Normalize and apply affine transform
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < hidden_size
+    x_ptrs = x_ptr + pid * stride_x + offs
+    
+    x = tl.load(x_ptrs, mask=mask, other=0.0)
+    w = tl.load(w_ptr + offs, mask=mask, other=0.0)
+    b = tl.load(b_ptr + offs, mask=mask, other=0.0)
 
-    # YOUR CODE HERE
-    pass
+    mean = tl.sum(x, axis=0) / hidden_size
+
+    x_centered = tl.where(mask, x - mean, 0.0)
+
+    var = tl.sum(x_centered * x_centered, axis=0) / hidden_size
+
+    rsqrt = 1.0 / tl.sqrt(var + eps)
+    out = (x_centered * rsqrt) * w + b
+
+    y_ptrs = y_ptr + pid * stride_y + offs
+    tl.store(y_ptrs, out, mask=mask)
 
 
 @triton.jit
@@ -126,6 +123,26 @@ def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     # Step 3: Store output
 
     # YOUR CODE HERE
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
+    r = tl.load(x_ptr + offs, mask=mask, other=0.0)
+
+    #这里可以注意精度问题！！！！！！！！！！！！！！！！！！！！！！！
+    #这里有没有可以简化的方法！！！！！！！！！！！！！！！！！！！！！！
+    sqrt_pi = 0.7978845608028654  # sqrt(2/pi)
+    r_32 = r.to(tl.float32)
+
+    res = r_32 * r_32 * r_32 * 0.044715
+    res = res + r_32
+    res = res * sqrt_pi
+    res = libdevice.tanh(res) + 1
+    res = res * 0.5 * r_32
+
+    #y_16 = res.to(tl.float16)
+    #好像输入的时候就是32精度的？
+
+    tl.store(y_ptr + offs, res, mask=mask)
+
     pass
 
 
@@ -133,21 +150,13 @@ def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
 def silu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     """
     SiLU/Swish: x * sigmoid(x)
-
-    *** TODO: Implement this kernel ***
     """
     pid = tl.program_id(0)
-
-    # ============================================================================
-    # TODO: Implement SiLU kernel
-    # ============================================================================
-    #
-    # Step 1: Load input tile
-    # Step 2: Compute sigmoid
-    # Step 3: Multiply and store
-
-    # YOUR CODE HERE
-    pass
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    y = x * tl.sigmoid(x)
+    tl.store(y_ptr + offs, y, mask=mask)
 
 
 @triton.jit
@@ -168,27 +177,33 @@ def linear_kernel_tf32(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """
-    TF32-style matmul: output = A @ B.
-    A: (M, K), B: (K, N), C: (M, N)
-
-    *** TODO: Implement this kernel ***
-
-    Grid: (M // BLOCK_M, N // BLOCK_N)
-    """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    # ============================================================================
-    # TODO: Implement tiled matrix multiplication
-    # ============================================================================
-    #
-    # Step 1: Initialize accumulator
-    # Step 2: Loop over K tiles and accumulate tl.dot
-    # Step 3: Store the result
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # YOUR CODE HERE
-    pass
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    for k in range(0, K, BLOCK_K):
+        a_mask = (offs_m[:, None] < M) & (k + offs_k[None, :] < K)
+        b_mask = (k + offs_k[:, None] < K) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
 
 
 @triton.jit
@@ -334,7 +349,7 @@ def embedding_kernel(
 def softmax_kernel(x_ptr, y_ptr, stride_x, stride_y, n_cols, BLOCK_SIZE: tl.constexpr):
     """
     Numerically stable softmax over last dimension.
-
+    
     *** TODO: Implement this kernel ***
     """
     row = tl.program_id(0)
@@ -348,8 +363,14 @@ def softmax_kernel(x_ptr, y_ptr, stride_x, stride_y, n_cols, BLOCK_SIZE: tl.cons
     # Step 3: Compute exp and normalize
     # Step 4: Store output
 
-    # YOUR CODE HERE
-    pass
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < n_cols
+    x = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=-float("inf"))
+    x = x - tl.max(x, axis=0)
+    exp_x = tl.exp(x)
+    denom = tl.sum(exp_x, axis=0)
+    y = exp_x / denom
+    tl.store(y_ptr + row * stride_y + cols, y, mask=mask)
 
 
 @triton.jit
