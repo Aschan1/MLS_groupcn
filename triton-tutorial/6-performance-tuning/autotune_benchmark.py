@@ -54,7 +54,7 @@ def main():
     N = 1024 * 1024 * 32  # 32M elements (~128MB)
     print(f"Vector Size: {N:,} elements")
 
-    candidate_sizes = [32, 64, 128, 256, 512, 1024]
+    candidate_sizes = [32, 64, 128, 256, 512, 1024, 2048]
 
     best_time = float("inf")
     best_size = -1
