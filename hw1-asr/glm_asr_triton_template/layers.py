@@ -67,7 +67,6 @@ def rmsnorm_kernel(
     out = x_normed * w
     y_ptrs = y_ptr + pid * stride_y + offs
     tl.store(y_ptrs, out, mask=mask)
-    pass
 
 
 @triton.jit
@@ -135,15 +134,13 @@ def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     res = r_32 * r_32 * r_32 * 0.044715
     res = res + r_32
     res = res * sqrt_pi
-    res = libdevice.tanh(res) + 1
+    res = tl.extra.cuda.libdevice.tanh(res) + 1
     res = res * 0.5 * r_32
 
     #y_16 = res.to(tl.float16)
     #好像输入的时候就是32精度的？
 
     tl.store(y_ptr + offs, res, mask=mask)
-
-    pass
 
 
 @triton.jit
@@ -176,9 +173,19 @@ def linear_kernel_tf32(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    """Matmul with L2 cache-aware tile scheduling (swizzle)."""
+    # L2 swizzle: 1D grid → grouped (pid_m, pid_n) for better cache locality
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
@@ -223,10 +230,19 @@ def linear_gelu_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
-    """Fused Linear + GELU."""
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    """Fused Linear + GELU with L2 swizzle."""
+    # L2 swizzle
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -278,10 +294,19 @@ def swiglu_fused_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
-    """Fused SwiGLU: SiLU(x @ gate) * (x @ up)."""
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    """Fused SwiGLU: SiLU(x @ gate) * (x @ up) with L2 swizzle."""
+    # L2 swizzle
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -617,7 +642,7 @@ def gelu(x: torch.Tensor) -> torch.Tensor:
     """GELU activation using Triton."""
     original_shape = x.shape
     total = int(np.prod(x.shape))
-    block = 256
+    block = 1024
 
     x_flat = x.reshape(-1).contiguous().to(torch.float32)
     output = torch.empty_like(x_flat)
@@ -634,7 +659,7 @@ def silu(x: torch.Tensor) -> torch.Tensor:
     """SiLU activation using Triton."""
     original_shape = x.shape
     total = int(np.prod(x.shape))
-    block = 256
+    block = 1024
 
     x_flat = x.reshape(-1).contiguous().to(torch.float32)
     output = torch.empty_like(x_flat)
@@ -758,8 +783,7 @@ class Linear:
         )
 
         grid = (
-            triton.cdiv(M_padded, self.TILE_M),
-            triton.cdiv(self._N_padded, self.TILE_N),
+            triton.cdiv(M_padded, self.TILE_M) * triton.cdiv(self._N_padded, self.TILE_N),
         )
         linear_kernel_tf32[grid](
             x_padded,
@@ -777,6 +801,9 @@ class Linear:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            GROUP_SIZE_M=8,
+            num_warps=8,
+            num_stages=3,
         )
 
         output = output[:M, :N]
@@ -902,7 +929,8 @@ class MLP:
             self._up_weight_t = self.up_proj.weight.t().contiguous()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_gating and MLP.FUSED and x.is_cuda:
+        M = int(np.prod(x.shape[:-1]))
+        if self.use_gating and MLP.FUSED and x.is_cuda and M >= self.TILE_M:
             return self._forward_fused(x)
         return self._forward_standard(x)
 
@@ -958,8 +986,7 @@ class MLP:
         )
 
         grid = (
-            triton.cdiv(M_pad, self.TILE_M),
-            triton.cdiv(N_pad, self.TILE_N),
+            triton.cdiv(M_pad, self.TILE_M) * triton.cdiv(N_pad, self.TILE_N),
         )
         swiglu_fused_kernel[grid](
             x_padded,
@@ -980,6 +1007,9 @@ class MLP:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            GROUP_SIZE_M=8,
+            num_warps=8,
+            num_stages=3,
         )
 
         if M != M_pad or N != N_pad:
@@ -1018,7 +1048,8 @@ class EncoderMLP:
             self._fc1_weight_t = self.fc1.weight.t().contiguous()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        if EncoderMLP.FUSED and self.activation == "gelu" and x.is_cuda:
+        M = int(np.prod(x.shape[:-1]))
+        if EncoderMLP.FUSED and self.activation == "gelu" and x.is_cuda and M >= self.TILE_M:
             return self._forward_fused(x)
         return self._forward_standard(x)
 
@@ -1064,8 +1095,7 @@ class EncoderMLP:
         )
 
         grid = (
-            triton.cdiv(M_pad, self.TILE_M),
-            triton.cdiv(N_pad, self.TILE_N),
+            triton.cdiv(M_pad, self.TILE_M) * triton.cdiv(N_pad, self.TILE_N),
         )
         linear_gelu_kernel[grid](
             x_padded,
@@ -1083,6 +1113,9 @@ class EncoderMLP:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            GROUP_SIZE_M=8,
+            num_warps=8,
+            num_stages=3,
         )
 
         if M != M_pad or N != N_pad:
