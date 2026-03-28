@@ -697,6 +697,7 @@ class Linear:
         self.weight = torch.zeros((out_features, in_features), dtype=torch.float32)
         self.bias_param = torch.zeros(out_features, dtype=torch.float32) if bias else None
 
+        self._weight_t = None  # pre-transposed weight for torch path
         self._weight_t_padded = None
         self._K_padded = None
         self._N_padded = None
@@ -741,7 +742,10 @@ class Linear:
 
         if self.weight.device != x.device:
             self.weight = self.weight.to(x.device)
-        output = x_2d @ self.weight.t()
+            self._weight_t = None
+        if self._weight_t is None:
+            self._weight_t = self.weight.t().contiguous()
+        output = x_2d @ self._weight_t
 
         if self.has_bias and self.bias_param is not None:
             if self.bias_param.device != x.device:
@@ -763,6 +767,7 @@ class Linear:
 
         if self.weight.device != x.device:
             self.weight = self.weight.to(x.device)
+            self._weight_t = None
             self._weight_t_padded = None
         self._ensure_weight_prepared()
 
