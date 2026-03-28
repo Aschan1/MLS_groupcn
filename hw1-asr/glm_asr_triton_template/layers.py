@@ -7,6 +7,7 @@ Fill in the TODO sections to implement core layers using Triton kernels
 """
 
 import math
+import os
 from typing import Optional, Tuple
 
 import numpy as np
@@ -36,6 +37,83 @@ def next_power_of_two(x: int) -> int:
     return 1 << (x - 1).bit_length() if x > 0 else 1
 
 
+TRITON_TUNING_CONFIGS = {
+    "cfg1": {
+        "LINEAR_TILE_M": 64,
+        "LINEAR_TILE_N": 64,
+        "LINEAR_TILE_K": 32,
+        "LINEAR_NUM_WARPS": 4,
+        "LINEAR_NUM_STAGES": 2,
+
+        "MLP_TILE_M": 64,
+        "MLP_TILE_N": 64,
+        "MLP_TILE_K": 32,
+        "MLP_NUM_WARPS": 4,
+        "MLP_NUM_STAGES": 2,
+
+        "ENCODER_MLP_TILE_M": 64,
+        "ENCODER_MLP_TILE_N": 64,
+        "ENCODER_MLP_TILE_K": 32,
+        "ENCODER_MLP_NUM_WARPS": 4,
+        "ENCODER_MLP_NUM_STAGES": 2,
+    },
+    "cfg2": {
+        "LINEAR_TILE_M": 128,
+        "LINEAR_TILE_N": 64,
+        "LINEAR_TILE_K": 32,
+        "LINEAR_NUM_WARPS": 8,
+        "LINEAR_NUM_STAGES": 3,
+
+        "MLP_TILE_M": 128,
+        "MLP_TILE_N": 64,
+        "MLP_TILE_K": 32,
+        "MLP_NUM_WARPS": 8,
+        "MLP_NUM_STAGES": 3,
+
+        "ENCODER_MLP_TILE_M": 128,
+        "ENCODER_MLP_TILE_N": 64,
+        "ENCODER_MLP_TILE_K": 32,
+        "ENCODER_MLP_NUM_WARPS": 8,
+        "ENCODER_MLP_NUM_STAGES": 3,
+    },
+    "cfg3": {
+        "LINEAR_TILE_M": 64,
+        "LINEAR_TILE_N": 128,
+        "LINEAR_TILE_K": 32,
+        "LINEAR_NUM_WARPS": 8,
+        "LINEAR_NUM_STAGES": 3,
+
+        "MLP_TILE_M": 64,
+        "MLP_TILE_N": 128,
+        "MLP_TILE_K": 32,
+        "MLP_NUM_WARPS": 8,
+        "MLP_NUM_STAGES": 3,
+
+        "ENCODER_MLP_TILE_M": 64,
+        "ENCODER_MLP_TILE_N": 128,
+        "ENCODER_MLP_TILE_K": 32,
+        "ENCODER_MLP_NUM_WARPS": 8,
+        "ENCODER_MLP_NUM_STAGES": 3,
+    },
+}
+
+
+def _load_triton_tuning():
+    cfg_name = os.getenv("GLM_ASR_TRITON_CFG", "cfg1")
+    if cfg_name not in TRITON_TUNING_CONFIGS:
+        raise ValueError(
+            f"Unknown GLM_ASR_TRITON_CFG={cfg_name!r}. "
+            f"Available: {sorted(TRITON_TUNING_CONFIGS)}"
+        )
+    cfg = TRITON_TUNING_CONFIGS[cfg_name]
+    if os.getenv("GLM_ASR_PRINT_TUNING", "0") == "1":
+        print(f"[TUNING] GLM_ASR_TRITON_CFG={cfg_name} -> {cfg}")
+    return cfg_name, cfg
+
+
+TRITON_TUNING_NAME, TRITON_TUNING = _load_triton_tuning()
+
+
 # ============================================================================
 # Triton Kernels
 # ============================================================================
@@ -51,25 +129,22 @@ def rmsnorm_kernel(
     eps,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """
-    RMSNorm: x / RMS(x) * weight
-
-    *** TODO: Implement this kernel ***
-
-    Grid: (batch_size,)
-    """
     pid = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < hidden_size
+    x_ptrs = x_ptr + pid * stride_x + offs
+    x = tl.load(x_ptrs, mask=mask, other=0.0)
+    w = tl.load(w_ptr + offs, mask=mask, other=0.0)
 
-    # ============================================================================
-    # TODO: Implement RMSNorm kernel
-    # ============================================================================
-    #
-    # Step 1: Load input row and weight
-    # Step 2: Compute variance = mean(x^2)
-    # Step 3: Normalize: x / sqrt(variance + eps)
-    # Step 4: Apply weight and store
+    x_sq = x * x
+    var = tl.sum(x_sq, axis=0) / hidden_size
 
-    # YOUR CODE HERE
+    rsqrt = 1.0 / tl.sqrt(var + eps)
+    x_normed = x * rsqrt
+
+    out = x_normed * w
+    y_ptrs = y_ptr + pid * stride_y + offs
+    tl.store(y_ptrs, out, mask=mask)
     pass
 
 
@@ -85,27 +160,27 @@ def layernorm_kernel(
     eps,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """
-    LayerNorm: (x - mean) / sqrt(var + eps) * weight + bias
-
-    *** TODO: Implement this kernel ***
-
-    Grid: (batch_size,)
-    """
     pid = tl.program_id(0)
 
-    # ============================================================================
-    # TODO: Implement LayerNorm kernel
-    # ============================================================================
-    #
-    # Step 1: Load input, weight, and bias
-    # Step 2: Compute mean
-    # Step 3: Center the data
-    # Step 4: Compute variance = mean((x - mean)^2)
-    # Step 5: Normalize and apply affine transform
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < hidden_size
+    x_ptrs = x_ptr + pid * stride_x + offs
 
-    # YOUR CODE HERE
-    pass
+    x = tl.load(x_ptrs, mask=mask, other=0.0)
+    w = tl.load(w_ptr + offs, mask=mask, other=0.0)
+    b = tl.load(b_ptr + offs, mask=mask, other=0.0)
+
+    mean = tl.sum(x, axis=0) / hidden_size
+
+    x_centered = tl.where(mask, x - mean, 0.0)
+
+    var = tl.sum(x_centered * x_centered, axis=0) / hidden_size
+
+    rsqrt = 1.0 / tl.sqrt(var + eps)
+    out = (x_centered * rsqrt) * w + b
+
+    y_ptrs = y_ptr + pid * stride_y + offs
+    tl.store(y_ptrs, out, mask=mask)
 
 
 @triton.jit
@@ -130,19 +205,14 @@ def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     mask = offs < n_elements
     r = tl.load(x_ptr + offs, mask=mask, other=0.0)
 
-    #这里可以注意精度问题！！！！！！！！！！！！！！！！！！！！！！！
-    #这里有没有可以简化的方法！！！！！！！！！！！！！！！！！！！！！！
     sqrt_pi = 0.7978845608028654  # sqrt(2/pi)
     r_32 = r.to(tl.float32)
 
     res = r_32 * r_32 * r_32 * 0.044715
     res = res + r_32
     res = res * sqrt_pi
-    res = libdevice.tanh(res) + 1
+    res = tl.extra.cuda.libdevice.tanh(res) + 1
     res = res * 0.5 * r_32
-
-    #y_16 = res.to(tl.float16)
-    #好像输入的时候就是32精度的？
 
     tl.store(y_ptr + offs, res, mask=mask)
 
@@ -180,27 +250,33 @@ def linear_kernel_tf32(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """
-    TF32-style matmul: output = A @ B.
-    A: (M, K), B: (K, N), C: (M, N)
-
-    *** TODO: Implement this kernel ***
-
-    Grid: (M // BLOCK_M, N // BLOCK_N)
-    """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    # ============================================================================
-    # TODO: Implement tiled matrix multiplication
-    # ============================================================================
-    #
-    # Step 1: Initialize accumulator
-    # Step 2: Loop over K tiles and accumulate tl.dot
-    # Step 3: Store the result
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # YOUR CODE HERE
-    pass
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    for k in range(0, K, BLOCK_K):
+        a_mask = (offs_m[:, None] < M) & (k + offs_k[None, :] < K)
+        b_mask = (k + offs_k[:, None] < K) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b)
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
 
 
 @triton.jit
@@ -346,19 +422,10 @@ def embedding_kernel(
 def softmax_kernel(x_ptr, y_ptr, stride_x, stride_y, n_cols, BLOCK_SIZE: tl.constexpr):
     """
     Numerically stable softmax over last dimension.
-    
+
     *** TODO: Implement this kernel ***
     """
     row = tl.program_id(0)
-
-    # ============================================================================
-    # TODO: Implement softmax kernel
-    # ============================================================================
-    #
-    # Step 1: Load row with masking
-    # Step 2: Subtract max for stability
-    # Step 3: Compute exp and normalize
-    # Step 4: Store output
 
     cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < n_cols
@@ -655,9 +722,11 @@ def get_activation(name: str):
 class Linear:
     """Linear layer with switchable backend (torch or Triton)."""
 
-    TILE_M = 64
-    TILE_N = 64
-    TILE_K = 32
+    TILE_M = TRITON_TUNING["LINEAR_TILE_M"]
+    TILE_N = TRITON_TUNING["LINEAR_TILE_N"]
+    TILE_K = TRITON_TUNING["LINEAR_TILE_K"]
+    NUM_WARPS = TRITON_TUNING["LINEAR_NUM_WARPS"]
+    NUM_STAGES = TRITON_TUNING["LINEAR_NUM_STAGES"]
 
     BACKEND = "torch"
 
@@ -774,6 +843,8 @@ class Linear:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            num_warps=self.NUM_WARPS,
+            num_stages=self.NUM_STAGES,
         )
 
         output = output[:M, :N]
@@ -863,7 +934,11 @@ class MLP:
     """MLP with SwiGLU gating using Triton."""
 
     FUSED = True
-    TILE_M, TILE_N, TILE_K = 64, 64, 32
+    TILE_M = TRITON_TUNING["MLP_TILE_M"]
+    TILE_N = TRITON_TUNING["MLP_TILE_N"]
+    TILE_K = TRITON_TUNING["MLP_TILE_K"]
+    NUM_WARPS = TRITON_TUNING["MLP_NUM_WARPS"]
+    NUM_STAGES = TRITON_TUNING["MLP_NUM_STAGES"]
 
     def __init__(
         self,
@@ -977,6 +1052,8 @@ class MLP:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            num_warps=self.NUM_WARPS,
+            num_stages=self.NUM_STAGES,
         )
 
         if M != M_pad or N != N_pad:
@@ -990,7 +1067,11 @@ class EncoderMLP:
     """Encoder MLP (no gating) using Triton."""
 
     FUSED = True
-    TILE_M, TILE_N, TILE_K = 64, 64, 32
+    TILE_M = TRITON_TUNING["ENCODER_MLP_TILE_M"]
+    TILE_N = TRITON_TUNING["ENCODER_MLP_TILE_N"]
+    TILE_K = TRITON_TUNING["ENCODER_MLP_TILE_K"]
+    NUM_WARPS = TRITON_TUNING["ENCODER_MLP_NUM_WARPS"]
+    NUM_STAGES = TRITON_TUNING["ENCODER_MLP_NUM_STAGES"]
 
     def __init__(
         self,
@@ -1080,6 +1161,8 @@ class EncoderMLP:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            num_warps=self.NUM_WARPS,
+            num_stages=self.NUM_STAGES,
         )
 
         if M != M_pad or N != N_pad:
