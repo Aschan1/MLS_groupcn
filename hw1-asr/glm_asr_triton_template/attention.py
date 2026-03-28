@@ -38,6 +38,7 @@ def flash_attention_fwd_kernel(
     stride_mb, stride_mh, stride_mq, stride_mk,
     HAS_MASK: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    USE_FP16: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -73,6 +74,8 @@ def flash_attention_fwd_kernel(
     q_base = Q + batch_idx * stride_qb + head_idx * stride_qh
     q_ptrs = q_base + offs_q[:, None] * stride_qq + offs_d[None, :] * stride_qd
     q_tile = tl.load(q_ptrs, mask=(offs_q[:, None] < seq_q) & (offs_d[None, :] < BLOCK_D), other=0.0)
+    if USE_FP16:
+        q_tile = q_tile.to(tl.float16)
 
     # K/V base pointers (GQA: use kv_head_idx)
     k_base = K + batch_idx * stride_kb + kv_head_idx * stride_kh
@@ -100,9 +103,11 @@ def flash_attention_fwd_kernel(
             mask=(offs_d[:, None] < BLOCK_D) & (k_offs[None, :] < seq_k),
             other=0.0,
         )
+        if USE_FP16:
+            kt_tile = kt_tile.to(tl.float16)
 
         # S = Q @ K^T * scale : [BLOCK_Q, BLOCK_K]
-        s = tl.dot(q_tile, kt_tile) * scale
+        s = tl.dot(q_tile, kt_tile).to(tl.float32) * scale
 
         # Mask out-of-bounds keys
         s = tl.where(k_offs[None, :] < seq_k, s, float("-inf"))
@@ -151,7 +156,11 @@ def flash_attention_fwd_kernel(
         )
 
         # Accumulate: acc += P @ V
-        acc += tl.dot(p.to(tl.float32), v_tile)
+        if USE_FP16:
+            v_tile = v_tile.to(tl.float16)
+            acc += tl.dot(p.to(tl.float16), v_tile).to(tl.float32)
+        else:
+            acc += tl.dot(p.to(tl.float32), v_tile)
 
     # Final normalization: output = acc / l_i
     acc = acc / tl.where(l_i[:, None] > 0, l_i[:, None], 1.0)
@@ -282,6 +291,7 @@ class MultiHeadAttention:
         v: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         is_causal: bool = False,
+        use_fp16: bool = True,
     ) -> torch.Tensor:
         """
         Compute multi-head attention with GQA-native FlashAttention.
@@ -292,10 +302,12 @@ class MultiHeadAttention:
             v: (batch, num_kv_heads, seq_k, head_dim)
             attention_mask: Optional (batch, 1, seq_q, seq_k) or (batch, num_heads, seq_q, seq_k)
             is_causal: Whether to apply causal masking
+            use_fp16: Whether to use FP16 for dot products (accumulator stays FP32)
         """
         return scaled_dot_product_attention(
             q, k, v, attention_mask, is_causal, self.scale,
             num_kv_heads=k.shape[1],
+            use_fp16=use_fp16,
         )
 
     def _expand_kv(self, x: torch.Tensor, num_repeats: int) -> torch.Tensor:
@@ -313,20 +325,28 @@ def next_power_of_two(x: int) -> int:
 
 
 def _select_block_sizes(head_dim, seq_k):
-    """Select BLOCK_Q, BLOCK_K, BLOCK_D based on head_dim and SRAM budget."""
+    """Select BLOCK_Q, BLOCK_K, BLOCK_D, num_warps, num_stages based on head_dim and seq length."""
     BLOCK_D = next_power_of_two(head_dim)
     if head_dim <= 64:
+        # Encoder path: hd=64, large seq_len (~750)
         BLOCK_Q = 64
-        BLOCK_K = 32
+        BLOCK_K = 16
+        num_warps = 4
+        num_stages = 3
     elif head_dim <= 128:
+        # Decoder path: hd=128
         BLOCK_Q = 32
-        BLOCK_K = 32
+        BLOCK_K = 64
+        num_warps = 8
+        num_stages = 2
     else:
         BLOCK_Q = 16
         BLOCK_K = 16
+        num_warps = 4
+        num_stages = 2
     BLOCK_K = max(BLOCK_K, 16)
     BLOCK_Q = max(BLOCK_Q, 16)
-    return BLOCK_Q, BLOCK_K, BLOCK_D
+    return BLOCK_Q, BLOCK_K, BLOCK_D, num_warps, num_stages
 
 
 def scaled_dot_product_attention(
@@ -337,6 +357,7 @@ def scaled_dot_product_attention(
     is_causal: bool = False,
     scale: Optional[float] = None,
     num_kv_heads: Optional[int] = None,
+    use_fp16: bool = True,
 ) -> torch.Tensor:
     """
     Scaled dot-product attention using FlashAttention fused kernel.
@@ -368,7 +389,7 @@ def scaled_dot_product_attention(
         )
 
         # Block size selection
-        BLOCK_Q, BLOCK_K, BLOCK_D = _select_block_sizes(head_dim, seq_k)
+        BLOCK_Q, BLOCK_K, BLOCK_D, nw, ns = _select_block_sizes(head_dim, seq_k)
 
         # Attention mask handling
         has_mask = attention_mask is not None
@@ -393,9 +414,6 @@ def scaled_dot_product_attention(
         # Grid: one block per (batch*head, Q-block)
         grid = (batch * num_heads, triton.cdiv(seq_q, BLOCK_Q))
 
-        # Select num_warps based on head_dim
-        nw = 4 if head_dim <= 64 else 8
-
         flash_attention_fwd_kernel[grid](
             q_f, k_f, v_f, output,
             mask_ptr,
@@ -409,11 +427,12 @@ def scaled_dot_product_attention(
             stride_mb, stride_mh, stride_mq, stride_mk,
             HAS_MASK=has_mask,
             IS_CAUSAL=is_causal,
+            USE_FP16=use_fp16,
             BLOCK_Q=BLOCK_Q,
             BLOCK_K=BLOCK_K,
             BLOCK_D=BLOCK_D,
             num_warps=nw,
-            num_stages=2,
+            num_stages=ns,
         )
 
         return output.to(q.dtype)
@@ -498,6 +517,7 @@ if __name__ == "__main__":
         hidden_size=num_heads * head_dim,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
+        use_fp16 = True
     )
     output_gqa = attn(q, k_gqa, v_gqa)
     print(f"  Output shape: {output_gqa.shape}")
