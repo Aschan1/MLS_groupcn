@@ -697,27 +697,42 @@ class LayerNorm:
             self.bias = self.bias.to(x.device)
         return (self.weight * x_normed + self.bias).to(x.dtype)
 
-
 def gelu(x: torch.Tensor) -> torch.Tensor:
-    """GELU activation using Triton, with optional FP16 test mode."""
+    """GELU activation using Triton."""
     original_shape = x.shape
     total = int(np.prod(x.shape))
     block = 256
+
+    x_flat = x.reshape(-1).contiguous().to(torch.float32)
+    output = torch.empty_like(x_flat)
     grid = (triton.cdiv(total, block),)
 
     if x.is_cuda:
-        if GELU_FP16:
-            x_flat = x.reshape(-1).contiguous().to(torch.float16)
-            output = torch.empty_like(x_flat)
-            gelu_kernel_fp16[grid](x_flat, output, total, BLOCK_SIZE=block)
-            return output[:total].reshape(original_shape).to(x.dtype)
-        else:
-            x_flat = x.reshape(-1).contiguous().to(torch.float32)
-            output = torch.empty_like(x_flat)
-            gelu_kernel[grid](x_flat, output, total, BLOCK_SIZE=block)
-            return output[:total].reshape(original_shape).to(x.dtype)
+        gelu_kernel[grid](x_flat, output, total, BLOCK_SIZE=block)
+        return output[:total].reshape(original_shape).to(x.dtype)
 
     return torch.nn.functional.gelu(x)
+
+# def gelu(x: torch.Tensor) -> torch.Tensor:
+#     """GELU activation using Triton, with optional FP16 test mode."""
+#     original_shape = x.shape
+#     total = int(np.prod(x.shape))
+#     block = 256
+#     grid = (triton.cdiv(total, block),)
+
+#     if x.is_cuda:
+#         if GELU_FP16:
+#             x_flat = x.reshape(-1).contiguous().to(torch.float16)
+#             output = torch.empty_like(x_flat)
+#             gelu_kernel_fp16[grid](x_flat, output, total, BLOCK_SIZE=block)
+#             return output[:total].reshape(original_shape).to(x.dtype)
+#         else:
+#             x_flat = x.reshape(-1).contiguous().to(torch.float32)
+#             output = torch.empty_like(x_flat)
+#             gelu_kernel[grid](x_flat, output, total, BLOCK_SIZE=block)
+#             return output[:total].reshape(original_shape).to(x.dtype)
+
+#     return torch.nn.functional.gelu(x)
 
 
 def silu(x: torch.Tensor) -> torch.Tensor:

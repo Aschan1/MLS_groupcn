@@ -89,11 +89,8 @@ def compute_freqs_kernel(
     tl.store(sin_ptrs_1 + half_dim * stride_sin1, sin, mask=mask)
 
     cos_ptrs_1 = cos_ptr + offs * stride_cos1 + pid * stride_cos0
-    tl.store(cos_ptrs_1, cos, mask=mask)#应该concat两个cos ！！！
+    tl.store(cos_ptrs_1, cos, mask=mask)
     tl.store(cos_ptrs_1 + half_dim * stride_cos1, cos, mask=mask)
-
-    
-    pass
 
 
 # ============================================================================
