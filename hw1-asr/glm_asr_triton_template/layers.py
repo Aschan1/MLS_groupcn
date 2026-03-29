@@ -113,7 +113,7 @@ def _load_triton_tuning():
 
 TRITON_TUNING_NAME, TRITON_TUNING = _load_triton_tuning()
 
-
+GELU_FP16 = os.getenv("GLM_ASR_GELU_FP16", "0") == "1"
 # ============================================================================
 # Triton Kernels
 # ============================================================================
@@ -218,6 +218,27 @@ def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
 
     pass
 
+@triton.jit
+def gelu_kernel_fp16(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    """
+    GELU using mostly FP16 arithmetic for speed testing.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
+
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float16)
+
+    sqrt_pi = 0.7978845608028654  # sqrt(2/pi)
+
+    inner = x * x * x * 0.044715
+    inner = (inner + x) * sqrt_pi
+
+    # tanh still goes through libdevice in fp32 for safety
+    tanh_inner = tl.extra.cuda.libdevice.tanh(inner.to(tl.float32)).to(tl.float16)
+
+    out = x * 0.5 * (1.0 + tanh_inner)
+    tl.store(y_ptr + offs, out, mask=mask)
 
 @triton.jit
 def silu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
@@ -678,18 +699,23 @@ class LayerNorm:
 
 
 def gelu(x: torch.Tensor) -> torch.Tensor:
-    """GELU activation using Triton."""
+    """GELU activation using Triton, with optional FP16 test mode."""
     original_shape = x.shape
     total = int(np.prod(x.shape))
     block = 256
-
-    x_flat = x.reshape(-1).contiguous().to(torch.float32)
-    output = torch.empty_like(x_flat)
     grid = (triton.cdiv(total, block),)
 
     if x.is_cuda:
-        gelu_kernel[grid](x_flat, output, total, BLOCK_SIZE=block)
-        return output[:total].reshape(original_shape).to(x.dtype)
+        if GELU_FP16:
+            x_flat = x.reshape(-1).contiguous().to(torch.float16)
+            output = torch.empty_like(x_flat)
+            gelu_kernel_fp16[grid](x_flat, output, total, BLOCK_SIZE=block)
+            return output[:total].reshape(original_shape).to(x.dtype)
+        else:
+            x_flat = x.reshape(-1).contiguous().to(torch.float32)
+            output = torch.empty_like(x_flat)
+            gelu_kernel[grid](x_flat, output, total, BLOCK_SIZE=block)
+            return output[:total].reshape(original_shape).to(x.dtype)
 
     return torch.nn.functional.gelu(x)
 
